@@ -177,6 +177,9 @@ namespace config {
     // Video encryption settings for LAN and WAN streams
     int lan_encryption_mode;
     int wan_encryption_mode;
+
+    // Directory for per-session CSV streaming-stats export; empty disables the export
+    std::string stats_export_path;
   };
 
   struct nvhttp_t {

@@ -544,6 +544,8 @@ namespace config {
 
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
+
+    "",  // stats_export_path
   };
 
   nvhttp_t nvhttp {
@@ -1267,6 +1269,8 @@ namespace config {
 #endif
 
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
+
+    string_f(vars, "stats_export_path", stream.stats_export_path);
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 

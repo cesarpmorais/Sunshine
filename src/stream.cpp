@@ -28,6 +28,7 @@ extern "C" {
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
+#include "stat_trackers.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -115,6 +116,29 @@ namespace stream {
   static_assert(
     sizeof(video_short_frame_header_t) == 8,
     "Short frame header must be 8 bytes"
+  );
+
+  /**
+   * @brief Per-frame FEC status reported by Moonlight (SS_FRAME_FEC_STATUS).
+   *        All multi-byte fields are big-endian on the wire.
+   */
+  struct ss_frame_fec_status_t {
+    boost::endian::big_uint32_at frameIndex;
+    boost::endian::big_uint16_at highestReceivedSequenceNumber;
+    boost::endian::big_uint16_at nextContiguousSequenceNumber;
+    boost::endian::big_uint16_at missingPacketsBeforeHighestReceived;
+    boost::endian::big_uint16_at totalDataPackets;
+    boost::endian::big_uint16_at totalParityPackets;
+    boost::endian::big_uint16_at receivedDataPackets;
+    boost::endian::big_uint16_at receivedParityPackets;
+    std::uint8_t fecPercentage;
+    std::uint8_t multiFecBlockIndex;
+    std::uint8_t multiFecBlockCount;
+  };
+
+  static_assert(
+    sizeof(ss_frame_fec_status_t) == 21,
+    "SS_FRAME_FEC_STATUS payload must be 21 bytes"
   );
 
   struct video_packet_raw_t {
@@ -411,6 +435,8 @@ namespace stream {
     safe::signal_t controlEnd;
 
     std::atomic<session::state_e> state;
+
+    stat_trackers::csv_stats_logger csv_stats;
   };
 
   /**
@@ -952,6 +978,7 @@ namespace stream {
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
+      session->csv_stats.record_idr_request();
       session->video.idr_events->raise(true);
     });
 
@@ -966,6 +993,35 @@ namespace stream {
         << "lastFrame [" << lastFrame << ']';
 
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
+    });
+
+    // Sunshine protocol extension: modern Moonlight clients send a per-frame
+    // SS_FRAME_FEC_STATUS report on packet type SS_FRAME_FEC_PTYPE (0x5502)
+    // whenever a frame required FEC recovery or was lost. That value also
+    // identifies the outgoing IDX_SET_RGB_LED packet, but there is no conflict
+    // because this map only dispatches inbound (client -> server) packets.
+    server->map(SS_FRAME_FEC_PTYPE, [&](session_t *session, const std::string_view &payload) {
+      if (payload.size() < sizeof(ss_frame_fec_status_t)) {
+        BOOST_LOG(warning) << "Malformed SS_FRAME_FEC_STATUS packet"sv;
+        return;
+      }
+
+      auto status = (const ss_frame_fec_status_t *) payload.data();
+
+      uint32_t missing = status->missingPacketsBeforeHighestReceived;
+      uint32_t received = (uint32_t) status->receivedDataPackets + status->receivedParityPackets;
+
+      // The client could not rebuild the frame when it received fewer data plus
+      // parity shards than the frame needs.
+      bool unrecoverable = received < status->totalDataPackets;
+
+      BOOST_LOG(verbose)
+        << "type [SS_FRAME_FEC_STATUS]"sv << std::endl
+        << "frame [" << status->frameIndex << ']' << std::endl
+        << "missing packets [" << missing << ']' << std::endl
+        << "unrecoverable [" << unrecoverable << ']';
+
+      session->csv_stats.record_fec_status(missing, unrecoverable);
     });
 
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
@@ -1303,6 +1359,7 @@ namespace stream {
 
       auto session = (session_t *) packet->channel_data;
       auto lowseq = session->video.lowseq;
+      auto encoded_frame_bytes = packet->data_size();
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
       std::vector<uint8_t> payload_with_replacements;
@@ -1584,6 +1641,8 @@ namespace stream {
         });
 
         session->video.lowseq = lowseq;
+
+        session->csv_stats.record_frame(encoded_frame_bytes, frame_header.frame_processing_latency / 10.0, packet->is_idr());
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
@@ -1962,6 +2021,8 @@ namespace stream {
         platf::streaming_will_stop();
       }
 
+      session.csv_stats.stop();
+
       BOOST_LOG(debug) << "Session ended"sv;
     }
 
@@ -1990,6 +2051,8 @@ namespace stream {
       session.audio.peer.port(0);
 
       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+
+      session.csv_stats.start(config::stream.stats_export_path);
 
       session.audioThread = std::thread {audioThread, &session};
       session.videoThread = std::thread {videoThread, &session};
