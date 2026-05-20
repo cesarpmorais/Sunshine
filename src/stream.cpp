@@ -992,6 +992,7 @@ namespace stream {
         << "firstFrame [" << firstFrame << ']' << std::endl
         << "lastFrame [" << lastFrame << ']';
 
+      session->csv_stats.record_rfi_request();
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
     });
 
@@ -1356,6 +1357,7 @@ namespace stream {
       }
 
       frame_network_latency_logger.first_point_now();
+      auto frame_send_begin = std::chrono::steady_clock::now();
 
       auto session = (session_t *) packet->channel_data;
       auto lowseq = session->video.lowseq;
@@ -1642,7 +1644,20 @@ namespace stream {
 
         session->video.lowseq = lowseq;
 
-        session->csv_stats.record_frame(encoded_frame_bytes, frame_header.frame_processing_latency / 10.0, packet->is_idr());
+        auto frame_send_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - frame_send_begin
+        )
+                               .count();
+        session->csv_stats.record_frame(
+          encoded_frame_bytes,
+          frame_header.frame_processing_latency / 10.0,
+          packet->is_idr(),
+          frame_send_ms,
+          (std::uint32_t) ratecontrol_frame_packets_sent
+        );
+        if (auto *peer = session->control.peer) {
+          session->csv_stats.record_rtt(peer->roundTripTime, peer->roundTripTimeVariance);
+        }
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
@@ -2052,7 +2067,7 @@ namespace stream {
 
       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
 
-      session.csv_stats.start(config::stream.stats_export_path);
+      session.csv_stats.start(config::stream.stats_export_path, (std::uint32_t) session.config.monitor.bitrate);
 
       session.audioThread = std::thread {audioThread, &session};
       session.videoThread = std::thread {videoThread, &session};
