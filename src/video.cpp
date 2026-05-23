@@ -305,8 +305,34 @@ namespace video {
     FIXED_GOP_SIZE = 1 << 12,  ///< Use fixed small GOP size (encoder doesn't support on-demand IDR frames)
   };
 
+  // Forward declaration for `avcodec_encode_session_t::apply_pending_bitrate`.
+  // Defined below `make_avcodec_encode_session`.
+  avcodec_ctx_t build_avcodec_ctx(
+    const encoder_t &encoder,
+    const encoder_platform_formats_avcodec &platform_formats,
+    const config_t &config,
+    int bitrate_kbps,
+    const AVCodec *codec,
+    AVPixelFormat sw_fmt,
+    bool hardware,
+    platf::avcodec_encode_device_t &encode_device,
+    AVBufferRef *reuse_hw_frames_ctx
+  );
+
   class avcodec_encode_session_t: public encode_session_t {
   public:
+    /// @brief Inputs captured at session-create time so a runtime bitrate
+    ///        change can rebuild the AVCodecContext without re-running display
+    ///        or hwdevice setup. See `apply_pending_bitrate`.
+    struct reconfigure_inputs_t {
+      const encoder_t *encoder = nullptr;
+      const encoder_platform_formats_avcodec *platform_formats = nullptr;
+      const AVCodec *codec = nullptr;
+      config_t config {};
+      AVPixelFormat sw_fmt = AV_PIX_FMT_NONE;
+      bool hardware = false;
+    };
+
     avcodec_encode_session_t() = default;
 
     avcodec_encode_session_t(avcodec_ctx_t &&avcodec_ctx, std::unique_ptr<platf::avcodec_encode_device_t> encode_device, int inject):
@@ -339,6 +365,10 @@ namespace video {
 
       inject = other.inject;
 
+      reconfigure_inputs = std::move(other.reconfigure_inputs);
+      pending_bitrate_kbps = other.pending_bitrate_kbps;
+      other.pending_bitrate_kbps.reset();
+
       return *this;
     }
 
@@ -370,6 +400,67 @@ namespace video {
       request_idr_frame();
     }
 
+    bool set_bitrate(int bitrate_kbps) override {
+      if (!reconfigure_inputs.encoder || !reconfigure_inputs.platform_formats || !reconfigure_inputs.codec || !device) {
+        return false;
+      }
+      pending_bitrate_kbps = bitrate_kbps;
+      return true;
+    }
+
+    /// @brief If a bitrate change is pending, rebuild the AVCodecContext at the
+    ///        new target. Called from `encode_avcodec` before sending the next
+    ///        frame. On success the next frame is forced to IDR so the client
+    ///        recovers cleanly from the implicit codec discontinuity.
+    /// @return `true` if a successful reconfigure happened this call.
+    bool apply_pending_bitrate() {
+      if (!pending_bitrate_kbps) {
+        return false;
+      }
+      int target_kbps = *pending_bitrate_kbps;
+      pending_bitrate_kbps.reset();
+
+      if (!reconfigure_inputs.encoder || !reconfigure_inputs.platform_formats || !reconfigure_inputs.codec || !device || !avcodec_ctx) {
+        return false;
+      }
+
+      auto clamped_kbps = (config::video.max_bitrate > 0) ? std::min(target_kbps, config::video.max_bitrate) : target_kbps;
+      if (clamped_kbps <= 0) {
+        BOOST_LOG(warning) << "Ignoring bitrate reconfigure: non-positive target " << target_kbps << " kbps";
+        return false;
+      }
+
+      auto new_ctx = build_avcodec_ctx(
+        *reconfigure_inputs.encoder,
+        *reconfigure_inputs.platform_formats,
+        reconfigure_inputs.config,
+        clamped_kbps,
+        reconfigure_inputs.codec,
+        reconfigure_inputs.sw_fmt,
+        reconfigure_inputs.hardware,
+        *device,
+        avcodec_ctx->hw_frames_ctx
+      );
+
+      if (!new_ctx) {
+        BOOST_LOG(warning) << "Bitrate reconfigure to " << clamped_kbps << " kbps failed; keeping previous context";
+        return false;
+      }
+
+      // Flush the old context before replacing it so any in-flight frames
+      // drain cleanly. The new context starts fresh — first frame will be IDR.
+      if (avcodec_send_frame(avcodec_ctx.get(), nullptr) == 0) {
+        packet_raw_avcodec pkt;
+        while (avcodec_receive_packet(avcodec_ctx.get(), pkt.av_packet) == 0);
+      }
+
+      avcodec_ctx = std::move(new_ctx);
+      request_idr_frame();
+
+      BOOST_LOG(info) << "Bitrate reconfigured to " << clamped_kbps << " kbps";
+      return true;
+    }
+
     avcodec_ctx_t avcodec_ctx;
     std::unique_ptr<platf::avcodec_encode_device_t> device;
 
@@ -380,6 +471,9 @@ namespace video {
 
     // inject sps/vps data into idr pictures
     int inject;
+
+    reconfigure_inputs_t reconfigure_inputs;
+    std::optional<int> pending_bitrate_kbps;
   };
 
   class nvenc_encode_session_t: public encode_session_t {
@@ -423,6 +517,15 @@ namespace video {
       return result;
     }
 
+    bool set_bitrate(int bitrate_kbps) override {
+      // TODO(idea-10/PR#2a Linux scope): wire `NvEncReconfigureEncoder()` here
+      // for the Windows standalone-NVENC path. This session class is reachable
+      // only on Windows (Linux NVENC goes through the avcodec wrapper), so
+      // leaving this stubbed `false` is safe on the TCC test platform.
+      (void) bitrate_kbps;
+      return false;
+    }
+
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;
@@ -435,6 +538,7 @@ namespace video {
     safe::mail_raw_t::event_t<bool> idr_events;
     safe::mail_raw_t::event_t<hdr_info_t> hdr_events;
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_events;
+    safe::mail_raw_t::event_t<int> bitrate_change_events;
 
     config_t config;
     int frame_nr;
@@ -1508,6 +1612,10 @@ namespace video {
   }
 
   int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+    // Apply any pending runtime bitrate change before sending the next frame.
+    // On success the next encoded frame is automatically IDR.
+    session.apply_pending_bitrate();
+
     auto &frame = session.device->frame;
     frame->pts = frame_nr;
 
@@ -1611,50 +1719,39 @@ namespace video {
     return -1;
   }
 
-  std::unique_ptr<avcodec_encode_session_t> make_avcodec_encode_session(
-    platf::display_t *disp,
+  /**
+   * @brief Build a fresh AVCodecContext for the avcodec encode path.
+   *        Called both during initial session creation and at runtime when
+   *        a bitrate change is requested.
+   * @param encoder Encoder backend descriptor.
+   * @param platform_formats Backend platform formats (already known to be avcodec).
+   * @param config Stream configuration.
+   * @param bitrate_kbps Target bitrate in kbps (post-`max_bitrate` clamping).
+   * @param codec Resolved AVCodec for `video_format.name`.
+   * @param sw_fmt Software pixel format.
+   * @param hardware Whether the encoder is hardware-backed.
+   * @param encode_device The session's encode device (used for codec options /
+   *        hwdevice setup). Mutated during initial create; only `init_codec_options`
+   *        is called on the reconfigure path.
+   * @param reuse_hw_frames_ctx If non-null, the new context reuses this hw frames
+   *        pool instead of building a fresh hwdevice/hwframes chain. Pass the
+   *        previous context's `hw_frames_ctx` on a bitrate-change reinit so the
+   *        existing GPU frame pool and the session's AVFrame remain valid.
+   * @return Configured & opened context, or empty `avcodec_ctx_t` on failure.
+   */
+  avcodec_ctx_t build_avcodec_ctx(
     const encoder_t &encoder,
+    const encoder_platform_formats_avcodec &platform_formats,
     const config_t &config,
-    int width,
-    int height,
-    std::unique_ptr<platf::avcodec_encode_device_t> encode_device
+    int bitrate_kbps,
+    const AVCodec *codec,
+    AVPixelFormat sw_fmt,
+    bool hardware,
+    platf::avcodec_encode_device_t &encode_device,
+    AVBufferRef *reuse_hw_frames_ctx
   ) {
-    auto platform_formats = dynamic_cast<const encoder_platform_formats_avcodec *>(encoder.platform_formats.get());
-    if (!platform_formats) {
-      return nullptr;
-    }
-
-    bool hardware = platform_formats->avcodec_base_dev_type != AV_HWDEVICE_TYPE_NONE;
-
     auto &video_format = encoder.codec_from_config(config);
-    if (!video_format[encoder_t::PASSED] || !disp->is_codec_supported(video_format.name, config)) {
-      BOOST_LOG(error) << encoder.name << ": "sv << video_format.name << " mode not supported"sv;
-      return nullptr;
-    }
-
-    if (config.dynamicRange && !video_format[encoder_t::DYNAMIC_RANGE]) {
-      BOOST_LOG(error) << video_format.name << ": dynamic range not supported"sv;
-      return nullptr;
-    }
-
-    if (config.chromaSamplingType == 1 && !video_format[encoder_t::YUV444]) {
-      BOOST_LOG(error) << video_format.name << ": YUV 4:4:4 not supported"sv;
-      return nullptr;
-    }
-
-    auto codec = avcodec_find_encoder_by_name(video_format.name.c_str());
-    if (!codec) {
-      BOOST_LOG(error) << "Couldn't open ["sv << video_format.name << ']';
-
-      return nullptr;
-    }
-
-    auto colorspace = encode_device->colorspace;
-    auto sw_fmt = (colorspace.bit_depth == 8 && config.chromaSamplingType == 0)  ? platform_formats->avcodec_pix_fmt_8bit :
-                  (colorspace.bit_depth == 8 && config.chromaSamplingType == 1)  ? platform_formats->avcodec_pix_fmt_yuv444_8bit :
-                  (colorspace.bit_depth == 10 && config.chromaSamplingType == 0) ? platform_formats->avcodec_pix_fmt_10bit :
-                  (colorspace.bit_depth == 10 && config.chromaSamplingType == 1) ? platform_formats->avcodec_pix_fmt_yuv444_10bit :
-                                                                                   AV_PIX_FMT_NONE;
+    auto colorspace = encode_device.colorspace;
 
     // Allow up to 1 retry to apply the set of fallback options.
     //
@@ -1739,59 +1836,68 @@ namespace video {
       ctx->sw_pix_fmt = sw_fmt;
 
       if (hardware) {
-        avcodec_buffer_t encoding_stream_context;
+        ctx->pix_fmt = platform_formats.avcodec_dev_pix_fmt;
 
-        ctx->pix_fmt = platform_formats->avcodec_dev_pix_fmt;
+        if (reuse_hw_frames_ctx) {
+          // Runtime reconfigure path: reuse the existing GPU frame pool so the
+          // session's already-allocated AVFrame remains valid. No hwdevice or
+          // hwframe rebuild needed — only the rate-control parameters change.
+          ctx->hw_frames_ctx = av_buffer_ref(reuse_hw_frames_ctx);
+          ctx->slices = config.slicesPerFrame;
+        } else {
+          // Initial session creation: build the full hwdevice/hwframes chain.
+          avcodec_buffer_t encoding_stream_context;
 
-        // Create the base hwdevice context
-        auto buf_or_error = platform_formats->init_avcodec_hardware_input_buffer(encode_device.get());
-        if (buf_or_error.has_right()) {
-          return nullptr;
-        }
-        encoding_stream_context = std::move(buf_or_error.left());
+          // Create the base hwdevice context
+          auto buf_or_error = platform_formats.init_avcodec_hardware_input_buffer(&encode_device);
+          if (buf_or_error.has_right()) {
+            return {};
+          }
+          encoding_stream_context = std::move(buf_or_error.left());
 
-        // If this encoder requires derivation from the base, derive the desired type
-        if (platform_formats->avcodec_derived_dev_type != AV_HWDEVICE_TYPE_NONE) {
-          avcodec_buffer_t derived_context;
+          // If this encoder requires derivation from the base, derive the desired type
+          if (platform_formats.avcodec_derived_dev_type != AV_HWDEVICE_TYPE_NONE) {
+            avcodec_buffer_t derived_context;
 
-          // Allow the hwdevice to prepare for this type of context to be derived
-          if (encode_device->prepare_to_derive_context(platform_formats->avcodec_derived_dev_type)) {
-            return nullptr;
+            // Allow the hwdevice to prepare for this type of context to be derived
+            if (encode_device.prepare_to_derive_context(platform_formats.avcodec_derived_dev_type)) {
+              return {};
+            }
+
+            auto err = av_hwdevice_ctx_create_derived(&derived_context, platform_formats.avcodec_derived_dev_type, encoding_stream_context.get(), 0);
+            if (err) {
+              char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
+              BOOST_LOG(error) << "Failed to derive device context: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, err);
+
+              return {};
+            }
+
+            encoding_stream_context = std::move(derived_context);
           }
 
-          auto err = av_hwdevice_ctx_create_derived(&derived_context, platform_formats->avcodec_derived_dev_type, encoding_stream_context.get(), 0);
-          if (err) {
-            char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
-            BOOST_LOG(error) << "Failed to derive device context: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, err);
+          // Initialize avcodec hardware frames
+          {
+            avcodec_buffer_t frame_ref {av_hwframe_ctx_alloc(encoding_stream_context.get())};
 
-            return nullptr;
+            auto frame_ctx = (AVHWFramesContext *) frame_ref->data;
+            frame_ctx->format = ctx->pix_fmt;
+            frame_ctx->sw_format = sw_fmt;
+            frame_ctx->height = ctx->height;
+            frame_ctx->width = ctx->width;
+            frame_ctx->initial_pool_size = 0;
+
+            // Allow the hwdevice to modify hwframe context parameters
+            encode_device.init_hwframes(frame_ctx);
+
+            if (auto err = av_hwframe_ctx_init(frame_ref.get()); err < 0) {
+              return {};
+            }
+
+            ctx->hw_frames_ctx = av_buffer_ref(frame_ref.get());
           }
 
-          encoding_stream_context = std::move(derived_context);
+          ctx->slices = config.slicesPerFrame;
         }
-
-        // Initialize avcodec hardware frames
-        {
-          avcodec_buffer_t frame_ref {av_hwframe_ctx_alloc(encoding_stream_context.get())};
-
-          auto frame_ctx = (AVHWFramesContext *) frame_ref->data;
-          frame_ctx->format = ctx->pix_fmt;
-          frame_ctx->sw_format = sw_fmt;
-          frame_ctx->height = ctx->height;
-          frame_ctx->width = ctx->width;
-          frame_ctx->initial_pool_size = 0;
-
-          // Allow the hwdevice to modify hwframe context parameters
-          encode_device->init_hwframes(frame_ctx);
-
-          if (auto err = av_hwframe_ctx_init(frame_ref.get()); err < 0) {
-            return nullptr;
-          }
-
-          ctx->hw_frames_ctx = av_buffer_ref(frame_ref.get());
-        }
-
-        ctx->slices = config.slicesPerFrame;
       } else /* software */ {
         ctx->pix_fmt = sw_fmt;
 
@@ -1860,7 +1966,7 @@ namespace video {
         }
       }
 
-      auto bitrate = ((config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate) * 1000;
+      auto bitrate = bitrate_kbps * 1000;
       BOOST_LOG(info) << "Streaming bitrate is " << bitrate;
       ctx->rc_max_rate = bitrate;
       ctx->bit_rate = bitrate;
@@ -1895,7 +2001,7 @@ namespace video {
       }
 
       // Allow the encoding device a final opportunity to set/unset or override any options
-      encode_device->init_codec_options(ctx.get(), &options);
+      encode_device.init_codec_options(ctx.get(), &options);
 
       if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
         char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
@@ -1912,12 +2018,66 @@ namespace video {
             << video_format.name << "]: "sv
             << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, status);
 
-          return nullptr;
+          return {};
         }
       }
 
       // Successfully opened the codec
       break;
+    }
+
+    return ctx;
+  }
+
+  std::unique_ptr<avcodec_encode_session_t> make_avcodec_encode_session(
+    platf::display_t *disp,
+    const encoder_t &encoder,
+    const config_t &config,
+    int width,
+    int height,
+    std::unique_ptr<platf::avcodec_encode_device_t> encode_device
+  ) {
+    auto platform_formats = dynamic_cast<const encoder_platform_formats_avcodec *>(encoder.platform_formats.get());
+    if (!platform_formats) {
+      return nullptr;
+    }
+
+    bool hardware = platform_formats->avcodec_base_dev_type != AV_HWDEVICE_TYPE_NONE;
+
+    auto &video_format = encoder.codec_from_config(config);
+    if (!video_format[encoder_t::PASSED] || !disp->is_codec_supported(video_format.name, config)) {
+      BOOST_LOG(error) << encoder.name << ": "sv << video_format.name << " mode not supported"sv;
+      return nullptr;
+    }
+
+    if (config.dynamicRange && !video_format[encoder_t::DYNAMIC_RANGE]) {
+      BOOST_LOG(error) << video_format.name << ": dynamic range not supported"sv;
+      return nullptr;
+    }
+
+    if (config.chromaSamplingType == 1 && !video_format[encoder_t::YUV444]) {
+      BOOST_LOG(error) << video_format.name << ": YUV 4:4:4 not supported"sv;
+      return nullptr;
+    }
+
+    auto codec = avcodec_find_encoder_by_name(video_format.name.c_str());
+    if (!codec) {
+      BOOST_LOG(error) << "Couldn't open ["sv << video_format.name << ']';
+
+      return nullptr;
+    }
+
+    auto colorspace = encode_device->colorspace;
+    auto sw_fmt = (colorspace.bit_depth == 8 && config.chromaSamplingType == 0)  ? platform_formats->avcodec_pix_fmt_8bit :
+                  (colorspace.bit_depth == 8 && config.chromaSamplingType == 1)  ? platform_formats->avcodec_pix_fmt_yuv444_8bit :
+                  (colorspace.bit_depth == 10 && config.chromaSamplingType == 0) ? platform_formats->avcodec_pix_fmt_10bit :
+                  (colorspace.bit_depth == 10 && config.chromaSamplingType == 1) ? platform_formats->avcodec_pix_fmt_yuv444_10bit :
+                                                                                   AV_PIX_FMT_NONE;
+
+    auto initial_bitrate_kbps = (config::video.max_bitrate > 0) ? std::min(config.bitrate, config::video.max_bitrate) : config.bitrate;
+    auto ctx = build_avcodec_ctx(encoder, *platform_formats, config, initial_bitrate_kbps, codec, sw_fmt, hardware, *encode_device, nullptr);
+    if (!ctx) {
+      return nullptr;
     }
 
     avcodec_frame_t frame {av_frame_alloc()};
@@ -1992,6 +2152,18 @@ namespace video {
       config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0
     );
 
+    // Capture the inputs needed to rebuild the AVCodecContext on a runtime
+    // bitrate change. encoder_t and platform_formats live as long as the
+    // process (they are globals), and the AVCodec pointer is owned by FFmpeg.
+    session->reconfigure_inputs = avcodec_encode_session_t::reconfigure_inputs_t {
+      .encoder = &encoder,
+      .platform_formats = platform_formats,
+      .codec = codec,
+      .config = config,
+      .sw_fmt = sw_fmt,
+      .hardware = hardware,
+    };
+
     return session;
   }
 
@@ -2057,6 +2229,7 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto bitrate_change_events = mail->event<int>(mail::bitrate_change);
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2086,6 +2259,14 @@ namespace video {
       while (invalidate_ref_frames_events->peek()) {
         if (auto frames = invalidate_ref_frames_events->pop(0ms)) {
           session->invalidate_ref_frames(frames->first, frames->second);
+        }
+      }
+
+      // Drain any pending bitrate change requests. The session applies the
+      // change lazily on the next encoded frame and forces IDR.
+      while (bitrate_change_events->peek()) {
+        if (auto kbps = bitrate_change_events->pop(0ms)) {
+          session->set_bitrate(*kbps);
         }
       }
 
@@ -2361,6 +2542,13 @@ namespace video {
             ctx->idr_events->pop();
           }
 
+          // Drain any pending bitrate change requests for this session.
+          while (ctx->bitrate_change_events->peek()) {
+            if (auto kbps = ctx->bitrate_change_events->pop(0ms)) {
+              pos->session->set_bitrate(*kbps);
+            }
+          }
+
           if (frame_captured && pos->session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             ctx->shutdown_event->raise(true);
@@ -2546,6 +2734,7 @@ namespace video {
         std::move(idr_events),
         mail->event<hdr_info_t>(mail::hdr),
         mail->event<input::touch_port_t>(mail::touch_port),
+        mail->event<int>(mail::bitrate_change),
         config,
         1,
         channel_data,

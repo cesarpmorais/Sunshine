@@ -217,6 +217,14 @@ namespace video {
     virtual void request_normal_frame() = 0;
 
     virtual void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) = 0;
+
+    /**
+     * @brief Request a runtime change of the encoder's target bitrate.
+     *        The change may be applied lazily on the next encoded frame.
+     * @param bitrate_kbps New target bitrate, in kbps.
+     * @return `true` if the backend will honor the request, `false` if unsupported.
+     */
+    virtual bool set_bitrate(int bitrate_kbps) = 0;
   };
 
   // encoders

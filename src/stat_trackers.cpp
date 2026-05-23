@@ -180,6 +180,14 @@ namespace stat_trackers {
     interval.idr_requests += 1;
   }
 
+  void csv_stats_logger::set_target_kbps(std::uint32_t kbps) {
+    std::lock_guard lock(mutex);
+    if (!active) {
+      return;
+    }
+    target_bitrate_kbps = kbps;
+  }
+
   void csv_stats_logger::record_rfi_request() {
     std::lock_guard lock(mutex);
 

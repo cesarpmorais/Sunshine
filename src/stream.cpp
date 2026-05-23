@@ -4,9 +4,12 @@
  */
 
 // standard includes
+#include <array>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <queue>
+#include <unordered_map>
 
 // lib includes
 #include <boost/endian/arithmetic.hpp>
@@ -391,6 +394,7 @@ namespace stream {
 
       safe::mail_raw_t::event_t<bool> idr_events;
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
+      safe::mail_raw_t::event_t<int> bitrate_change_events;
 
       std::unique_ptr<platf::deinit_t> qos;
     } video;
@@ -1326,6 +1330,76 @@ namespace stream {
     }
   }
 
+  /**
+   * @brief Debug-only deterministic bitrate sweep driver.
+   *        Walks a fixed schedule of target bitrates per session so the PR #2a
+   *        runtime-reconfigure plumbing can be validated without an adaptive
+   *        controller. Enabled by `bitrate_sweep_test` in `sunshine.conf`.
+   *        Each step raises `bitrate_change_events` and updates the
+   *        `target_kbps` CSV column. No-op when the flag is off.
+   *
+   *        State is keyed on the session pointer and lives for the process
+   *        lifetime — fine for short lab runs, deliberately not wired into
+   *        `session_t` cleanup since this is a debug-only path.
+   */
+  void maybe_step_bitrate_sweep(session_t *session) {
+    if (config::stream.bitrate_sweep_test == 0) {
+      return;
+    }
+
+    // 18 -> 14 -> 10 -> 6 -> 3 -> 1 Mbps then symmetric ramp back up.
+    // Step every 30 s. After the last step the bitrate holds at 14 Mbps
+    // for the remainder of the session.
+    static constexpr std::array<int, 11> sweep_kbps {
+      18000,
+      14000,
+      10000,
+      6000,
+      3000,
+      1000,
+      3000,
+      6000,
+      10000,
+      14000,
+      14000
+    };
+    static constexpr auto step_interval = std::chrono::seconds {30};
+
+    struct sweep_state_t {
+      std::chrono::steady_clock::time_point started;
+      int last_step_idx = -1;
+    };
+
+    static std::mutex state_mutex;
+    static std::unordered_map<session_t *, sweep_state_t> state_by_session;
+
+    std::lock_guard lock(state_mutex);
+    auto now = std::chrono::steady_clock::now();
+    auto [it, inserted] = state_by_session.try_emplace(session);
+    if (inserted) {
+      it->second.started = now;
+    }
+
+    auto elapsed = now - it->second.started;
+    int idx = (int) (elapsed / step_interval);
+    if (idx < 0) {
+      idx = 0;
+    }
+    if (idx >= (int) sweep_kbps.size()) {
+      idx = sweep_kbps.size() - 1;
+    }
+
+    if (idx != it->second.last_step_idx) {
+      int kbps = sweep_kbps[idx];
+      BOOST_LOG(info) << "Bitrate sweep step " << idx << " -> " << kbps << " kbps";
+      if (session->video.bitrate_change_events) {
+        session->video.bitrate_change_events->raise(kbps);
+      }
+      session->csv_stats.set_target_kbps((std::uint32_t) kbps);
+      it->second.last_step_idx = idx;
+    }
+  }
+
   void videoBroadcastThread(udp::socket &sock) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
@@ -1360,6 +1434,10 @@ namespace stream {
       auto frame_send_begin = std::chrono::steady_clock::now();
 
       auto session = (session_t *) packet->channel_data;
+
+      // Debug-only: drive the deterministic bitrate sweep if enabled.
+      maybe_step_bitrate_sweep(session);
+
       auto lowseq = session->video.lowseq;
       auto encoded_frame_bytes = packet->data_size();
 
@@ -2107,6 +2185,7 @@ namespace stream {
 
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+      session->video.bitrate_change_events = mail->event<int>(mail::bitrate_change);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {

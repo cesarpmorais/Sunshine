@@ -122,6 +122,15 @@ namespace stat_trackers {
     /// @brief Record one reference-frame-invalidation (RFI) request received from the client.
     void record_rfi_request();
 
+    /**
+     * @brief Update the target bitrate reported in the `target_kbps` CSV column.
+     *        Call this whenever an adaptive controller (or the runtime
+     *        bitrate-change path) changes the encoder's target so the column
+     *        tracks the controller's trajectory.
+     * @param kbps New target bitrate in kbps.
+     */
+    void set_target_kbps(std::uint32_t kbps);
+
   private:
     /// @brief Write a CSV row and reset the interval accumulators. Caller must hold `mutex`.
     void write_row(std::chrono::steady_clock::time_point now);

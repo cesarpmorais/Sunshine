@@ -180,6 +180,12 @@ namespace config {
 
     // Directory for per-session CSV streaming-stats export; empty disables the export
     std::string stats_export_path;
+
+    // Debug-only: drive a deterministic bitrate sweep at runtime so the adaptive
+    // bitrate plumbing can be validated without a controller. Off (`0`) means
+    // bitrate stays at the initial negotiated value. See [[idea-10-abr-comparison]]
+    // §"Step 5a".
+    int bitrate_sweep_test;
   };
 
   struct nvhttp_t {

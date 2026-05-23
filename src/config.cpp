@@ -546,6 +546,7 @@ namespace config {
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
 
     "",  // stats_export_path
+    0,  // bitrate_sweep_test (off)
   };
 
   nvhttp_t nvhttp {
@@ -1271,6 +1272,7 @@ namespace config {
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
 
     string_f(vars, "stats_export_path", stream.stats_export_path);
+    int_f(vars, "bitrate_sweep_test", stream.bitrate_sweep_test);
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 
