@@ -546,6 +546,17 @@ namespace config {
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
 
     "",  // stats_export_path
+
+    "fixed",  // bitrate_mode
+    100,  // abr_rtt_threshold_ms
+    2000,  // abr_hysteresis_ms
+    20,  // abr_margin_ms
+    7500,  // abr_stable_time_ms
+    0.7,  // abr_beta
+    1.15,  // abr_gamma
+    500,  // abr_step_kbps
+    1000,  // abr_min_kbps
+    0,  // abr_max_kbps (0 = use negotiated)
   };
 
   nvhttp_t nvhttp {
@@ -1271,6 +1282,17 @@ namespace config {
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
 
     string_f(vars, "stats_export_path", stream.stats_export_path);
+
+    string_f(vars, "bitrate_mode", stream.bitrate_mode);
+    int_f(vars, "abr_rtt_threshold_ms", stream.abr_rtt_threshold_ms);
+    int_f(vars, "abr_hysteresis_ms", stream.abr_hysteresis_ms);
+    int_f(vars, "abr_margin_ms", stream.abr_margin_ms);
+    int_f(vars, "abr_stable_time_ms", stream.abr_stable_time_ms);
+    double_f(vars, "abr_beta", stream.abr_beta);
+    double_f(vars, "abr_gamma", stream.abr_gamma);
+    int_f(vars, "abr_step_kbps", stream.abr_step_kbps);
+    int_f(vars, "abr_min_kbps", stream.abr_min_kbps);
+    int_f(vars, "abr_max_kbps", stream.abr_max_kbps);
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 

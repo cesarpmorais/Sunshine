@@ -1687,6 +1687,7 @@ namespace stream {
             }
             session->csv_stats.set_target_kbps((std::uint32_t) *new_target);
           }
+          session->csv_stats.set_abr_state(static_cast<int>(session->video.bitrate_controller->current_state()));
         }
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
@@ -2138,7 +2139,23 @@ namespace stream {
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.bitrate_change_events = mail->event<int>(mail::bitrate_change);
-      session->video.bitrate_controller = std::make_unique<bitrate::bitrate_controller_t>(config.monitor.bitrate);
+      if (config::stream.bitrate_mode == "adaptive") {
+        bitrate::params_t abr_params {};
+        abr_params.rtt_threshold_ms = config::stream.abr_rtt_threshold_ms;
+        abr_params.hysteresis_ms = config::stream.abr_hysteresis_ms;
+        abr_params.margin_ms = config::stream.abr_margin_ms;
+        abr_params.stable_time_ms = config::stream.abr_stable_time_ms;
+        abr_params.beta = config::stream.abr_beta;
+        abr_params.gamma = config::stream.abr_gamma;
+        abr_params.step_kbps = config::stream.abr_step_kbps;
+        abr_params.min_kbps = config::stream.abr_min_kbps;
+        abr_params.max_kbps = config::stream.abr_max_kbps;
+        session->video.bitrate_controller = std::make_unique<bitrate::bitrate_controller_t>(config.monitor.bitrate, abr_params);
+        session->csv_stats.set_abr_state(static_cast<int>(bitrate::state_t::stable));
+        BOOST_LOG(info) << "Adaptive bitrate controller enabled (β=" << abr_params.beta
+                        << ", γ=" << abr_params.gamma
+                        << ", rtt_th=" << abr_params.rtt_threshold_ms << " ms)";
+      }
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {

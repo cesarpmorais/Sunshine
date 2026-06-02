@@ -131,6 +131,14 @@ namespace stat_trackers {
      */
     void set_target_kbps(std::uint32_t kbps);
 
+    /**
+     * @brief Update the controller-state code reported in the `abr_state`
+     *        CSV column. Values follow `bitrate::state_t`; -1 indicates the
+     *        adaptive controller is disabled for the session.
+     * @param state_code The new state code (a `bitrate::state_t` cast to int).
+     */
+    void set_abr_state(int state_code);
+
   private:
     /// @brief Write a CSV row and reset the interval accumulators. Caller must hold `mutex`.
     void write_row(std::chrono::steady_clock::time_point now);
@@ -147,6 +155,7 @@ namespace stat_trackers {
     std::uint32_t target_bitrate_kbps = 0;
     std::uint32_t last_rtt_ms = 0;
     std::uint32_t last_rtt_variance_ms = 0;
+    int last_abr_state = -1;  // -1 = controller disabled; else cast of bitrate::state_t
 
     struct accumulators {
       std::uint32_t frames = 0;

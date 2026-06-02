@@ -180,6 +180,22 @@ namespace config {
 
     // Directory for per-session CSV streaming-stats export; empty disables the export
     std::string stats_export_path;
+
+    // Adaptive bitrate controller (see [[idea-10-abr-comparison]]).
+    // `bitrate_mode = adaptive` enables the per-session AIMD controller;
+    // any other value (including the default "fixed") keeps the legacy
+    // static-bitrate behavior. The abr_* parameters tune the controller's
+    // policy; they are read at session start and held for the session.
+    std::string bitrate_mode;
+    int abr_rtt_threshold_ms;  // RTT above this is treated as congestion
+    int abr_hysteresis_ms;  // continuous over-threshold time before decrease fires
+    int abr_margin_ms;  // RTT must be below (threshold - margin) to count as clear
+    int abr_stable_time_ms;  // continuous clear time before increase fires
+    double abr_beta;  // multiplicative decrease factor (< 1.0)
+    double abr_gamma;  // phase-1 multiplicative recovery factor (> 1.0)
+    int abr_step_kbps;  // phase-2 linear probe step
+    int abr_min_kbps;  // bitrate floor
+    int abr_max_kbps;  // bitrate ceiling; 0 means use the negotiated target
   };
 
   struct nvhttp_t {

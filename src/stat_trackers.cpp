@@ -79,7 +79,8 @@ namespace stat_trackers {
 
     file << "elapsed_ms,frames,encoded_kb,bitrate_kbps,target_kbps,packets_sent,"
             "avg_encode_ms,avg_send_ms,stalls,stall_ms,rtt_ms,rtt_var_ms,"
-            "idr_frames,fec_events,missing_packets,unrecoverable_frames,idr_requests,rfi_requests\n";
+            "idr_frames,fec_events,missing_packets,unrecoverable_frames,idr_requests,rfi_requests,"
+            "abr_state\n";
     file << std::fixed << std::setprecision(2);
 
     auto now = std::chrono::steady_clock::now();
@@ -188,6 +189,14 @@ namespace stat_trackers {
     target_bitrate_kbps = kbps;
   }
 
+  void csv_stats_logger::set_abr_state(int state_code) {
+    std::lock_guard lock(mutex);
+    if (!active) {
+      return;
+    }
+    last_abr_state = state_code;
+  }
+
   void csv_stats_logger::record_rfi_request() {
     std::lock_guard lock(mutex);
 
@@ -225,7 +234,8 @@ namespace stat_trackers {
          << interval.missing_packets << ','
          << interval.unrecoverable_frames << ','
          << interval.idr_requests << ','
-         << interval.rfi_requests << '\n';
+         << interval.rfi_requests << ','
+         << last_abr_state << '\n';
     file.flush();
 
     interval = {};
