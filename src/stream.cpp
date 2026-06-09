@@ -2146,14 +2146,15 @@ namespace stream {
         abr_params.margin_ms = config::stream.abr_margin_ms;
         abr_params.stable_time_ms = config::stream.abr_stable_time_ms;
         abr_params.beta = config::stream.abr_beta;
-        abr_params.gamma = config::stream.abr_gamma;
-        abr_params.step_kbps = config::stream.abr_step_kbps;
+        abr_params.cubic_recovery_ms = config::stream.abr_cubic_recovery_ms;
+        abr_params.fast_convergence = config::stream.abr_fast_convergence;
         abr_params.min_kbps = config::stream.abr_min_kbps;
         abr_params.max_kbps = config::stream.abr_max_kbps;
         session->video.bitrate_controller = std::make_unique<bitrate::bitrate_controller_t>(config.monitor.bitrate, abr_params);
         session->csv_stats.set_abr_state(static_cast<int>(bitrate::state_t::stable));
         BOOST_LOG(info) << "Adaptive bitrate controller enabled (β=" << abr_params.beta
-                        << ", γ=" << abr_params.gamma
+                        << ", K=" << abr_params.cubic_recovery_ms << " ms"
+                        << ", fast_conv=" << (abr_params.fast_convergence ? "on" : "off")
                         << ", rtt_th=" << abr_params.rtt_threshold_ms << " ms)";
       }
       session->video.lowseq = 0;

@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <cmath>
 
 namespace bitrate {
 
@@ -65,6 +66,13 @@ namespace bitrate {
     state = rtt_over_since ? state_t::congested : state_t::stable;
 
     // ── Decrease branch: sustained congestion. ─────────────────────────────
+    // Plain β multiplicative cut. The new target is also subject to fast
+    // convergence (CUBIC Eq. 3.7): when a decrease fires while we have not
+    // yet recovered to the previous ceiling (`current_kbps < last_known_good`),
+    // the new `last_known_good` is set *below* the current rate, not equal to
+    // it. This shrinks the recovery target on each cascade so the cubic
+    // plateaus closer to the actual carrying capacity instead of forever
+    // aiming at a stale ceiling.
     if (rtt_over_since && now - *rtt_over_since >= milliseconds(params.hysteresis_ms)) {
       const int new_kbps = std::max(static_cast<int>(current_kbps * params.beta), params.min_kbps);
       if (new_kbps == current_kbps) {
@@ -72,8 +80,13 @@ namespace bitrate {
         // we do not advertise a decrease that did not happen.
         return std::nullopt;
       }
-      last_known_good = current_kbps;
+      if (params.fast_convergence && current_kbps < last_known_good) {
+        last_known_good = static_cast<int>(current_kbps * (1.0 + params.beta) / 2.0);
+      } else {
+        last_known_good = current_kbps;
+      }
       current_kbps = new_kbps;
+      last_decrease_at = now;
       // Re-arm the streak from "now" so a second decrease only fires after
       // another full hysteresis window of continued congestion.
       rtt_over_since = now;
@@ -81,24 +94,36 @@ namespace bitrate {
       return current_kbps;
     }
 
-    // ── Increase branch: sustained clear. ──────────────────────────────────
-    if (rtt_clear_since && now - *rtt_clear_since >= milliseconds(params.stable_time_ms)) {
-      const int recovery_target = static_cast<int>(0.9 * last_known_good);
-      int new_kbps;
-      state_t new_state;
-      if (current_kbps < recovery_target) {
-        // Phase 1: multiplicative recovery toward the last known good.
-        new_kbps = std::min(static_cast<int>(current_kbps * params.gamma), effective_max_kbps);
-        new_state = state_t::recovering;
-      } else {
-        // Phase 2: linear probing past the previous ceiling.
-        new_kbps = std::min(current_kbps + params.step_kbps, effective_max_kbps);
-        new_state = state_t::probing;
-      }
+    // ── Increase branch: sustained clear, CUBIC curve. ─────────────────────
+    // B(t) = C · (t − K)³ + last_known_good
+    //   t  = wall-clock seconds since the last decrease (last_decrease_at).
+    //   K  = params.cubic_recovery_ms / 1000
+    //   C  = (1 − β) · last_known_good / K³        (so B(0) = β · last_known_good)
+    //
+    // Concave for t < K (rapid catch-up), plateau at t ≈ K, convex for t > K
+    // (cautious then accelerating probe). We clamp the new target at
+    // [current_kbps, effective_max_kbps] so the curve never drives the bitrate
+    // downward — sampling the curve at any t > 0 should monotonically grow.
+    //
+    // The 5b (anchor at rtt_clear_since) and 5c (don't reset rtt_clear_since
+    // on growth) iterations both made empirical results worse on constrained
+    // scenarios; see [[results-idea-5b]] and [[results-idea-5c]]. We keep
+    // the original Idea 5 anchor (`last_decrease_at`) and reset
+    // `rtt_clear_since` on successful growth to gate the next growth tick
+    // by `stable_time_ms`.
+    if (last_decrease_at && rtt_clear_since &&
+        now - *rtt_clear_since >= milliseconds(params.stable_time_ms)) {
+      const double t = std::chrono::duration<double>(now - *last_decrease_at).count();
+      const double K = params.cubic_recovery_ms / 1000.0;
+      const double C = (1.0 - params.beta) * static_cast<double>(last_known_good) / (K * K * K);
+      const double B_t = C * std::pow(t - K, 3) + static_cast<double>(last_known_good);
+      const int new_kbps = std::clamp(static_cast<int>(B_t), current_kbps, effective_max_kbps);
       if (new_kbps == current_kbps) {
-        // Already at the ceiling.
+        // Curve hasn't risen above the current rate this tick (we are still
+        // in the concave plateau, or already at the ceiling). No actuation.
         return std::nullopt;
       }
+      const state_t new_state = (new_kbps < last_known_good) ? state_t::recovering : state_t::probing;
       current_kbps = new_kbps;
       rtt_clear_since = now;
       state = new_state;

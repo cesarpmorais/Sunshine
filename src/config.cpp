@@ -551,10 +551,10 @@ namespace config {
     100,  // abr_rtt_threshold_ms
     2000,  // abr_hysteresis_ms
     20,  // abr_margin_ms
-    7500,  // abr_stable_time_ms
+    1000,  // abr_stable_time_ms
     0.7,  // abr_beta
-    1.15,  // abr_gamma
-    500,  // abr_step_kbps
+    15000,  // abr_cubic_recovery_ms
+    true,  // abr_fast_convergence
     1000,  // abr_min_kbps
     0,  // abr_max_kbps (0 = use negotiated)
   };
@@ -1289,8 +1289,8 @@ namespace config {
     int_f(vars, "abr_margin_ms", stream.abr_margin_ms);
     int_f(vars, "abr_stable_time_ms", stream.abr_stable_time_ms);
     double_f(vars, "abr_beta", stream.abr_beta);
-    double_f(vars, "abr_gamma", stream.abr_gamma);
-    int_f(vars, "abr_step_kbps", stream.abr_step_kbps);
+    int_f(vars, "abr_cubic_recovery_ms", stream.abr_cubic_recovery_ms);
+    bool_f(vars, "abr_fast_convergence", stream.abr_fast_convergence);
     int_f(vars, "abr_min_kbps", stream.abr_min_kbps);
     int_f(vars, "abr_max_kbps", stream.abr_max_kbps);
 

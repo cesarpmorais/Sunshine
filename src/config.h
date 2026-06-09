@@ -192,8 +192,8 @@ namespace config {
     int abr_margin_ms;  // RTT must be below (threshold - margin) to count as clear
     int abr_stable_time_ms;  // continuous clear time before increase fires
     double abr_beta;  // multiplicative decrease factor (< 1.0)
-    double abr_gamma;  // phase-1 multiplicative recovery factor (> 1.0)
-    int abr_step_kbps;  // phase-2 linear probe step
+    int abr_cubic_recovery_ms;  // CUBIC K — wall-clock time to recover to last_known_good after a cut
+    bool abr_fast_convergence;  // apply CUBIC Eq. 3.7 (shrink last_known_good on cascade decreases)
     int abr_min_kbps;  // bitrate floor
     int abr_max_kbps;  // bitrate ceiling; 0 means use the negotiated target
   };
